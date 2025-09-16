@@ -13,6 +13,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 import matplotlib
+from matplotlib import font_manager
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
@@ -24,6 +25,8 @@ class CsvRangeSlicerApp(tk.Tk):
         super().__init__()
         self.title("CSV Range Slicer (pandas + matplotlib)")
         self.geometry("1100x700")
+
+        self._configure_matplotlib_fonts()
         
         # State
         self.df = None
@@ -45,6 +48,29 @@ class CsvRangeSlicerApp(tk.Tk):
         self._selected_pos_range = None
         
         self._build_ui()
+
+    def _configure_matplotlib_fonts(self):
+        """Ensure matplotlib uses a font that can render Japanese labels."""
+        candidates = [
+            "IPAexGothic",
+            "IPAPGothic",
+            "TakaoPGothic",
+            "Yu Gothic",
+            "Hiragino Sans",
+            "Hiragino Kaku Gothic ProN",
+            "Meiryo",
+            "Noto Sans CJK JP",
+            "Noto Sans JP",
+            "Source Han Sans JP",
+        ]
+        for name in candidates:
+            try:
+                font_manager.findfont(name, fallback_to_default=False)
+            except Exception:
+                continue
+            matplotlib.rcParams["font.family"] = name
+            break
+        matplotlib.rcParams["axes.unicode_minus"] = False
     
     def _build_ui(self):
         # Top controls
@@ -59,7 +85,7 @@ class CsvRangeSlicerApp(tk.Tk):
         self.index_cmb.bind("<<ComboboxSelected>>", lambda e: self.on_index_change())
         self.index_cmb.pack(side=tk.LEFT)
         
-        self.chk_parse_dt_var = tk.BooleanVar(value=True)
+        self.chk_parse_dt_var = tk.BooleanVar(value=False)
         self.chk_parse_dt = ttk.Checkbutton(top, text="indexを日時として解釈(可能なら)", variable=self.chk_parse_dt_var, command=self.on_index_change)
         self.chk_parse_dt.pack(side=tk.LEFT, padx=8)
         
