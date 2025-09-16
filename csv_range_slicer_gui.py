@@ -33,6 +33,7 @@ class CsvRangeSlicerApp(tk.Tk):
         self.span = None
         self.sel_xmin = None
         self.sel_xmax = None
+        self._working_df = None
         
         self._build_ui()
     
@@ -44,7 +45,7 @@ class CsvRangeSlicerApp(tk.Tk):
         btn_open = ttk.Button(top, text="CSVを開く...", command=self.open_csv)
         btn_open.pack(side=tk.LEFT, padx=4)
         
-        ttk.Label(top, text="index列:").pack(side=tk.LEFT, padx=(12,4))
+        ttk.Label(top, text="横軸(インデックス)列:").pack(side=tk.LEFT, padx=(12,4))
         self.index_cmb = ttk.Combobox(top, state="readonly", width=24, values=[])
         self.index_cmb.bind("<<ComboboxSelected>>", lambda e: self.on_index_change())
         self.index_cmb.pack(side=tk.LEFT)
@@ -143,8 +144,10 @@ class CsvRangeSlicerApp(tk.Tk):
         self.df = df
         cols = list(df.columns)
         
-        # 推定: index候補は1列目
-        default_index = cols[0] if cols else None
+        # 推定: index候補はtimestampらしき列
+        default_index = self._guess_timestamp_like_column(df)
+        if default_index is None and cols:
+            default_index = cols[0]
         # 値候補は index 以外の最初の数値列
         default_value = None
         for c in cols:
@@ -167,6 +170,50 @@ class CsvRangeSlicerApp(tk.Tk):
         self._update_sel_label()
         
         self.on_index_change()
+
+    def _guess_timestamp_like_column(self, df):
+        """Return column name that looks like timestamp, otherwise None."""
+        if df is None or df.empty:
+            return None
+
+        keywords = ("timestamp", "time", "date", "datetime", "ts")
+        best_col = None
+        best_score = -1.0
+
+        for col in df.columns:
+            series = df[col]
+            name_lower = str(col).lower()
+            contains_keyword = any(k in name_lower for k in keywords)
+
+            # Skip columns that are clearly not timestamp-like
+            if pd.api.types.is_numeric_dtype(series) and not contains_keyword and not pd.api.types.is_datetime64_any_dtype(series):
+                continue
+
+            valid_ratio = 0.0
+            if pd.api.types.is_datetime64_any_dtype(series):
+                valid_ratio = 1.0
+            else:
+                try:
+                    parsed = pd.to_datetime(series, errors="coerce", infer_datetime_format=True, utc=False)
+                    valid_ratio = parsed.notna().mean()
+                except Exception:
+                    valid_ratio = 0.0
+
+            # Require sufficient success to avoid accidental matches
+            if valid_ratio < 0.6 and not (contains_keyword and valid_ratio >= 0.4):
+                continue
+
+            score = valid_ratio
+            if contains_keyword:
+                score += 0.3
+            if pd.api.types.is_datetime64_any_dtype(series):
+                score += 0.1
+
+            if score > best_score:
+                best_score = score
+                best_col = col
+
+        return best_col
     
     def on_index_change(self):
         if self.df is None:
@@ -207,7 +254,10 @@ class CsvRangeSlicerApp(tk.Tk):
         val_name = self.value_cmb.get()
         if not idx_name or not val_name:
             return
-        
+
+        if self._working_df is None:
+            return
+
         if val_name not in self._working_df.columns:
             messagebox.showwarning("列が見つかりません", f"値列 '{val_name}' がデータフレームに存在しません。")
             return
@@ -251,7 +301,11 @@ class CsvRangeSlicerApp(tk.Tk):
         if self.sel_xmin is None or self.sel_xmax is None:
             messagebox.showinfo("区間未選択", "エクスポートする前に、グラフ上で範囲をドラッグして選択してください。")
             return
-        
+
+        if self._working_df is None:
+            messagebox.showerror("エクスポート失敗", "横軸が設定されていないため、データを切り出せません。CSVを読み込み直してください。")
+            return
+
         # Build sliced DataFrame by index range
         dfw = self._working_df.copy()
         # Ensure index name set for output clarity
