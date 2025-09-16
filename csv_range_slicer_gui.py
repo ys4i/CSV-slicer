@@ -8,7 +8,6 @@ CSV Range Slicer GUI
 - 範囲選択(SpanSelector)→選択区間のみCSV出力
 
 依存: pandas, matplotlib
-(Arch Linux) 例: sudo pacman -S python-pandas python-matplotlib
 """
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
