@@ -437,6 +437,9 @@ class CsvRangeSlicerApp(tk.Tk):
         # Set as index on a working frame for plotting
         tmp = self.df.copy()
         tmp.index = series
+        if idx_name in tmp.columns:
+            # Drop the original index column to avoid duplicates when exporting/resetting
+            tmp = tmp.drop(columns=[idx_name])
         self.current_index_name = idx_name
 
         # Keep for plotting/export
