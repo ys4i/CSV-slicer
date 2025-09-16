@@ -28,12 +28,21 @@ class CsvRangeSlicerApp(tk.Tk):
         # State
         self.df = None
         self.current_index_name = None
-        self.current_value_name = None
         self.index_is_datetime = False
         self.span = None
         self.sel_xmin = None
         self.sel_xmax = None
         self._working_df = None
+        self.value_columns = []
+        self.value_visibility = {}
+        self._line_by_column = {}
+        self._legend_entry_by_column = {}
+        self._legend_artist_map = {}
+        self._legend_pick_cid = None
+        self._plot_title_base = "グラフ"
+        self._x_axis_mode = "numeric"
+        self._x_axis_source_index = None
+        self._selected_pos_range = None
         
         self._build_ui()
     
@@ -54,10 +63,8 @@ class CsvRangeSlicerApp(tk.Tk):
         self.chk_parse_dt = ttk.Checkbutton(top, text="indexを日時として解釈(可能なら)", variable=self.chk_parse_dt_var, command=self.on_index_change)
         self.chk_parse_dt.pack(side=tk.LEFT, padx=8)
         
-        ttk.Label(top, text="値列:").pack(side=tk.LEFT, padx=(12,4))
-        self.value_cmb = ttk.Combobox(top, state="readonly", width=24, values=[])
-        self.value_cmb.bind("<<ComboboxSelected>>", lambda e: self.redraw_plot())
-        self.value_cmb.pack(side=tk.LEFT)
+        self.value_info = ttk.Label(top, text="値列: index以外の全数値列をプロット")
+        self.value_info.pack(side=tk.LEFT, padx=(12,4))
         
         btn_plot = ttk.Button(top, text="プロット更新", command=self.redraw_plot)
         btn_plot.pack(side=tk.LEFT, padx=8)
@@ -68,7 +75,7 @@ class CsvRangeSlicerApp(tk.Tk):
         # Selection info
         self.sel_label = ttk.Label(self, text="選択区間: 未選択", anchor="w")
         self.sel_label.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0,6))
-        
+
         # Matplotlib Figure
         fig = Figure(figsize=(6,4), dpi=100)
         self.ax = fig.add_subplot(111)
@@ -79,13 +86,16 @@ class CsvRangeSlicerApp(tk.Tk):
         self.canvas = FigureCanvasTkAgg(fig, master=self)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        
+
         # Toolbar
         toolbar = NavigationToolbar2Tk(self.canvas, self)
         toolbar.update()
-        
+
         # Span selector (created after data is plotted)
         self._create_span_selector()
+
+        # Enable legend interaction
+        self._legend_pick_cid = self.canvas.mpl_connect("pick_event", self._on_legend_pick)
     
     def _create_span_selector(self):
         # Remove existing span if any
@@ -113,16 +123,48 @@ class CsvRangeSlicerApp(tk.Tk):
     def _update_sel_label(self):
         if self.sel_xmin is None or self.sel_xmax is None:
             self.sel_label.config(text="選択区間: 未選択")
+            self._selected_pos_range = None
             return
-        
-        if self.index_is_datetime:
-            # Convert matplotlib date numbers to pandas Timestamps for display
+
+        mode = getattr(self, "_x_axis_mode", "numeric")
+        xmin, xmax = self.sel_xmin, self.sel_xmax
+        if mode == "datetime":
             import matplotlib.dates as mdates
-            ts_min = pd.to_datetime(mdates.num2date(self.sel_xmin))
-            ts_max = pd.to_datetime(mdates.num2date(self.sel_xmax))
+
+            def _to_naive(ts):
+                if getattr(ts, "tzinfo", None) is None:
+                    return ts
+                try:
+                    return ts.tz_convert(None)
+                except Exception:
+                    try:
+                        return ts.tz_localize(None)
+                    except Exception:
+                        return ts
+
+            ts_min = _to_naive(pd.to_datetime(mdates.num2date(xmin)))
+            ts_max = _to_naive(pd.to_datetime(mdates.num2date(xmax)))
+            self._selected_pos_range = None
             self.sel_label.config(text=f"選択区間: {ts_min} 〜 {ts_max}")
+        elif mode == "positional":
+            index_values = self._x_axis_source_index
+            if index_values is None or len(index_values) == 0:
+                self._selected_pos_range = None
+                self.sel_label.config(text=f"選択区間: {xmin:.6g} 〜 {xmax:.6g}")
+                return
+            n = len(index_values)
+            start_pos = int(np.clip(np.floor(xmin + 0.5), 0, n - 1))
+            end_pos = int(np.clip(np.floor(xmax + 0.5), 0, n - 1))
+            if end_pos < start_pos:
+                start_pos, end_pos = end_pos, start_pos
+            self._selected_pos_range = (start_pos, end_pos)
+            start_val = index_values[start_pos]
+            end_val = index_values[end_pos]
+            self.sel_label.config(
+                text=f"選択区間: {start_val} 〜 {end_val} (位置 {start_pos}〜{end_pos})")
         else:
-            self.sel_label.config(text=f"選択区間: {self.sel_xmin:.6g} 〜 {self.sel_xmax:.6g}")
+            self._selected_pos_range = None
+            self.sel_label.config(text=f"選択区間: {xmin:.6g} 〜 {xmax:.6g}")
     
     def open_csv(self):
         path = filedialog.askopenfilename(
@@ -148,27 +190,27 @@ class CsvRangeSlicerApp(tk.Tk):
         default_index = self._guess_timestamp_like_column(df)
         if default_index is None and cols:
             default_index = cols[0]
-        # 値候補は index 以外の最初の数値列
-        default_value = None
-        for c in cols:
-            if c != default_index and pd.api.types.is_numeric_dtype(df[c]):
-                default_value = c
-                break
-        if default_value is None and len(cols) >= 2:
-            default_value = cols[1]
-        
         # Set comboboxes
         self.index_cmb["values"] = cols
-        self.value_cmb["values"] = cols
         if default_index:
             self.index_cmb.set(default_index)
-        if default_value:
-            self.value_cmb.set(default_value)
-        
+
         # Reset selection
         self.sel_xmin = self.sel_xmax = None
         self._update_sel_label()
-        
+
+        # Reset plot column info until index handling runs
+        self.value_columns = []
+        self.value_visibility = {}
+        self._sync_value_visibility()
+        self._line_by_column = {}
+        self._legend_entry_by_column = {}
+        self._legend_artist_map = {}
+        self._x_axis_mode = "numeric"
+        self._x_axis_source_index = None
+        self._selected_pos_range = None
+        self._update_value_info()
+
         self.on_index_change()
 
     def _guess_timestamp_like_column(self, df):
@@ -214,7 +256,163 @@ class CsvRangeSlicerApp(tk.Tk):
                 best_col = col
 
         return best_col
+
+    def _select_plot_columns(self, idx_name):
+        """Determine which columns should be plotted (exclude index column)."""
+        if self.df is None or not idx_name:
+            return []
+
+        numeric_cols = []
+        convertible_cols = []
+        for col in self.df.columns:
+            if col == idx_name:
+                continue
+            series = self.df[col]
+            if pd.api.types.is_numeric_dtype(series):
+                numeric_cols.append(col)
+            else:
+                try:
+                    converted = pd.to_numeric(series, errors="coerce")
+                except Exception:
+                    continue
+                if converted.notna().mean() > 0.7:
+                    convertible_cols.append(col)
+
+        if numeric_cols:
+            return numeric_cols
+        return convertible_cols
+
+    def _update_value_info(self):
+        if not hasattr(self, "value_info"):
+            return
+        if not self.value_columns:
+            self.value_info.config(text="値列: プロット可能な列がありません")
+            return
+        visible_cols = [c for c in self.value_columns if self.value_visibility.get(c, True)]
+        total = len(self.value_columns)
+        visible = len(visible_cols)
+        if total <= 4:
+            joined = ", ".join(f"{c}{'' if self.value_visibility.get(c, True) else '(非表示)'}" for c in self.value_columns)
+            self.value_info.config(text=f"値列: {joined} (凡例クリックで切替)")
+        else:
+            self.value_info.config(text=f"値列: {visible} / {total} 列を表示中 (凡例クリックで切替)")
+
+    def _sync_value_visibility(self):
+        if self.value_columns is None:
+            self.value_visibility = {}
+            return
+        new_vis = {}
+        for col in self.value_columns:
+            new_vis[col] = self.value_visibility.get(col, True)
+        self.value_visibility = new_vis
     
+    def _update_legend_style(self, col):
+        entry = self._legend_entry_by_column.get(col)
+        if not entry:
+            return
+        handle, text = entry
+        alpha = 1.0 if self.value_visibility.get(col, True) else 0.2
+        try:
+            handle.set_alpha(alpha)
+        except Exception:
+            pass
+        try:
+            text.set_alpha(alpha)
+        except Exception:
+            pass
+
+    def _setup_legend_interactivity(self):
+        legend = self.ax.get_legend()
+        self._legend_artist_map = {}
+        self._legend_entry_by_column = {}
+        if legend is None:
+            return
+        handles = []
+        if hasattr(legend, "legendHandles"):
+            try:
+                handles = list(legend.legendHandles)
+            except Exception:
+                handles = []
+        if not handles and hasattr(legend, "legend_handles"):
+            try:
+                handles = list(legend.legend_handles)
+            except Exception:
+                handles = []
+        if not handles:
+            try:
+                handles = list(legend.get_lines())
+            except Exception:
+                handles = []
+        texts = list(legend.get_texts())
+        for handle, text in zip(handles, texts):
+            label = text.get_text()
+            if label not in self._line_by_column:
+                continue
+            try:
+                handle.set_picker(10)
+            except Exception:
+                pass
+            if hasattr(handle, "set_pickradius"):
+                try:
+                    handle.set_pickradius(12)
+                except Exception:
+                    pass
+            try:
+                text.set_picker(10)
+            except Exception:
+                pass
+            self._legend_artist_map[handle] = label
+            self._legend_artist_map[text] = label
+            self._legend_entry_by_column[label] = (handle, text)
+            self._update_legend_style(label)
+
+    def _refresh_plot_title(self, has_visible=None):
+        if has_visible is None:
+            has_visible = any(line.get_visible() for line in self._line_by_column.values())
+        base = getattr(self, "_plot_title_base", "グラフ") or "グラフ"
+        if has_visible:
+            self.ax.set_title(base)
+        else:
+            self.ax.set_title(base + "\n(凡例をクリックで列を表示)")
+
+    def _autoscale_to_visible(self):
+        """Autoscale axes considering only currently visible lines."""
+        try:
+            self.ax.relim(visible_only=True)
+        except TypeError:
+            # Older matplotlib without visible_only argument
+            self.ax.relim()
+        except Exception:
+            return
+        try:
+            self.ax.autoscale_view()
+        except Exception:
+            pass
+
+    def _on_legend_pick(self, event):
+        artist = getattr(event, "artist", None)
+        if artist is None:
+            return
+        label = self._legend_artist_map.get(artist)
+        if label is None and hasattr(artist, "get_label"):
+            try:
+                label = artist.get_label()
+            except Exception:
+                label = None
+        if label is None or label not in self.value_columns:
+            return
+        self.value_visibility[label] = not self.value_visibility.get(label, True)
+        line = self._line_by_column.get(label)
+        if line is not None:
+            line.set_visible(self.value_visibility[label])
+        self._update_legend_style(label)
+        self._update_value_info()
+        has_visible = any(line.get_visible() for line in self._line_by_column.values())
+        if has_visible:
+            self._autoscale_to_visible()
+        self._refresh_plot_title(has_visible)
+        self.canvas.draw_idle()
+
     def on_index_change(self):
         if self.df is None:
             return
@@ -240,10 +438,17 @@ class CsvRangeSlicerApp(tk.Tk):
         tmp = self.df.copy()
         tmp.index = series
         self.current_index_name = idx_name
-        
+
         # Keep for plotting/export
         self._working_df = tmp
-        
+        self.value_columns = self._select_plot_columns(idx_name)
+        self._sync_value_visibility()
+        self._line_by_column = {}
+        self._legend_entry_by_column = {}
+        self._legend_artist_map = {}
+        self._selected_pos_range = None
+        self._update_value_info()
+
         # Redraw
         self.redraw_plot()
     
@@ -251,47 +456,110 @@ class CsvRangeSlicerApp(tk.Tk):
         if self.df is None:
             return
         idx_name = self.current_index_name or self.index_cmb.get()
-        val_name = self.value_cmb.get()
-        if not idx_name or not val_name:
+        if not idx_name:
             return
 
         if self._working_df is None:
             return
 
-        if val_name not in self._working_df.columns:
-            messagebox.showwarning("列が見つかりません", f"値列 '{val_name}' がデータフレームに存在しません。")
+        if not self.value_columns:
+            self.ax.clear()
+            xlabel = idx_name + (" (datetime)" if self.index_is_datetime else "")
+            self.ax.set_title("プロット可能な値列がありません")
+            self.ax.set_xlabel(xlabel)
+            self.ax.set_ylabel("値")
+            self._line_by_column = {}
+            self._legend_artist_map = {}
+            self._legend_entry_by_column = {}
+            self._selected_pos_range = None
+            self.canvas.draw_idle()
+            self._create_span_selector()
+            self.sel_xmin = self.sel_xmax = None
+            self._update_sel_label()
             return
-        
-        y = self._working_df[val_name]
-        
-        # Clear plot
-        self.ax.clear()
-        self.ax.set_title(f"{val_name} vs {idx_name}")
-        self.ax.set_xlabel(idx_name + (" (datetime)" if self.index_is_datetime else ""))
-        self.ax.set_ylabel(val_name)
-        
+
+        # Determine x-axis values once
         if self.index_is_datetime:
-            # matplotlib handles datetime index natively
-            self.ax.plot(self._working_df.index, y)
+            x_values = self._working_df.index
+            xlabel = idx_name + " (datetime)"
+            self._x_axis_mode = "datetime"
+            self._x_axis_source_index = self._working_df.index
         else:
-            # try numeric conversion for x; if fails, use positional index
             try:
-                x = pd.to_numeric(self._working_df.index, errors="coerce")
-                if x.notna().mean() > 0.8:
-                    self.ax.plot(x, y)
+                numeric_index = pd.to_numeric(self._working_df.index, errors="coerce")
+                if numeric_index.notna().mean() > 0.8:
+                    x_values = numeric_index
+                    xlabel = idx_name
+                    self._x_axis_mode = "numeric"
+                    self._x_axis_source_index = None
                 else:
-                    self.ax.plot(np.arange(len(y)), y)
-                    self.ax.set_xlabel(f"{idx_name} (非数値: 順序インデックス表示)")
+                    x_values = np.arange(len(self._working_df.index))
+                    xlabel = f"{idx_name} (非数値: 順序インデックス表示)"
+                    self._x_axis_mode = "positional"
+                    self._x_axis_source_index = self._working_df.index
             except Exception:
-                self.ax.plot(np.arange(len(y)), y)
-                self.ax.set_xlabel(f"{idx_name} (順序インデックス表示)")
-        
+                x_values = np.arange(len(self._working_df.index))
+                xlabel = f"{idx_name} (順序インデックス表示)"
+                self._x_axis_mode = "positional"
+                self._x_axis_source_index = self._working_df.index
+
+        # Clear plot and draw each value column
+        self.ax.clear()
+        self.ax.set_xlabel(xlabel)
+        self.ax.set_ylabel("値")
+
+        title_base = f"{idx_name} に対する各列の推移"
+        self._plot_title_base = title_base
+        self._line_by_column = {}
+
+        plotted_any = False
+        for col in self.value_columns:
+            if col not in self._working_df.columns:
+                continue
+            series = self._working_df[col]
+            if not pd.api.types.is_numeric_dtype(series):
+                series = pd.to_numeric(series, errors="coerce")
+            if hasattr(series, "notna") and series.notna().sum() == 0:
+                continue
+            line, = self.ax.plot(x_values, series, label=str(col))
+            visible = self.value_visibility.get(col, True)
+            line.set_visible(visible)
+            self._line_by_column[col] = line
+            plotted_any = True
+
+        if not plotted_any:
+            self._line_by_column = {}
+            self._legend_artist_map = {}
+            self._legend_entry_by_column = {}
+            self._plot_title_base = "プロット可能な値列がありません"
+            self.ax.clear()
+            self.ax.set_title("プロット可能な値列がありません")
+            self.ax.set_xlabel(xlabel)
+            self.ax.set_ylabel("値")
+            self.canvas.draw_idle()
+            self._create_span_selector()
+            self.sel_xmin = self.sel_xmax = None
+            self._selected_pos_range = None
+            self._update_sel_label()
+            return
+
+        if self._line_by_column:
+            self.ax.legend(loc="upper right")
+        self._setup_legend_interactivity()
+
+        has_visible = any(line.get_visible() for line in self._line_by_column.values())
+        self._refresh_plot_title(has_visible)
+
+        if has_visible:
+            self._autoscale_to_visible()
+
         self.canvas.draw_idle()
-        
+
         # Re-create span selector for fresh axes
         self._create_span_selector()
         # Reset selection
         self.sel_xmin = self.sel_xmax = None
+        self._selected_pos_range = None
         self._update_sel_label()
     
     def export_csv(self):
@@ -323,16 +591,25 @@ class CsvRangeSlicerApp(tk.Tk):
             sliced = dfw.loc[mask]
         else:
             # Try to interpret index as numeric; fallback to positional slice by x-range over numeric-projected index
-            try:
-                idx_num = pd.to_numeric(dfw.index, errors="coerce")
+            if self._x_axis_mode == "positional" and self._selected_pos_range is not None:
+                start_pos, end_pos = self._selected_pos_range
+                if end_pos < start_pos:
+                    start_pos, end_pos = end_pos, start_pos
+                end_pos = min(end_pos, len(dfw) - 1)
+                sliced = dfw.iloc[start_pos:end_pos + 1]
+            else:
+                try:
+                    idx_num = pd.to_numeric(dfw.index, errors="coerce")
+                except Exception:
+                    idx_num = None
+                if idx_num is None:
+                    messagebox.showerror("エクスポート失敗", "indexを数値として扱えないため、切り出しに失敗しました。数値または日時のindexを選んでください。")
+                    return
                 xmin, xmax = self.sel_xmin, self.sel_xmax
                 if xmax < xmin:
                     xmin, xmax = xmax, xmin
                 mask = (idx_num >= xmin) & (idx_num <= xmax)
                 sliced = dfw.loc[mask]
-            except Exception:
-                messagebox.showerror("エクスポート失敗", "indexを数値として扱えないため、切り出しに失敗しました。数値または日時のindexを選んでください。")
-                return
         
         if sliced.empty:
             messagebox.showwarning("空の結果", "選択区間にデータがありません。")
